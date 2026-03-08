@@ -1,12 +1,16 @@
 // src/main.zig — Physarum polycephalum slime mold simulation
 //
-// Algorithm per frame:
-//   1. Sense: each agent samples trail at left/center/right offsets, steers toward max
-//   2. Rotate & move: update agent angle and position
-//   3. Deposit: write trail value at agent position
-//   4. Diffuse: 3x3 box blur on trail grid
-//   5. Decay: multiply trail by (1 - DECAY)
-//   6. Render: map trail [0,1] through a palette into the SDL texture
+// Controls:
+//   1-6        cycle colour schemes
+//   [ / ]      decay slower / faster
+//   , / .      sensor distance shorter / longer
+//   ; / '      turn speed down / up
+//   - / =      agent speed down / up
+//   D / F      diffuse weight down / up
+//   R          reset everything
+//   C          clear trail (agents keep going)
+//   P          pause / resume
+//   Escape     quit
 
 const std = @import("std");
 const math = std.math;
@@ -15,164 +19,192 @@ const c = @cImport({
     @cInclude("SDL2/SDL.h");
 });
 
-// ── Simulation constants ──────────────────────────────────────────────────────
+// ── Grid dimensions ───────────────────────────────────────────────────────────
 const SIM_W: usize = 1280;
 const SIM_H: usize = 720;
-const WIN_W: c_int = @intCast(SIM_W);
-const WIN_H: c_int = @intCast(SIM_H);
-
+const WIN_W: c_int  = @intCast(SIM_W);
+const WIN_H: c_int  = @intCast(SIM_H);
 const NUM_AGENTS: usize = 200_000;
 
-// Agent parameters
-const AGENT_SPEED: f32     = 1.5;   // pixels per step
-const SENSOR_DIST: f32     = 9.0;   // how far ahead to sample
-const SENSOR_ANGLE: f32    = 0.436; // ~25 deg in radians
-const TURN_SPEED: f32      = 0.3;   // radians per step (max random turn)
-const DEPOSIT: f32         = 5.0;   // trail deposited per step
-const DECAY: f32           = 0.012; // fraction removed per step
-const DIFFUSE_WEIGHT: f32  = 0.2;   // blend factor toward blurred value
+// ── Tunable parameters (live, mutated by key presses) ─────────────────────────
+var p_speed:          f32 = 1.5;
+var p_sensor_dist:    f32 = 9.0;
+var p_sensor_angle:   f32 = 0.436; // ~25 deg, kept fixed for now
+var p_turn_speed:     f32 = 0.3;
+var p_deposit:        f32 = 5.0;
+var p_decay:          f32 = 0.012;
+var p_diffuse_weight: f32 = 0.2;
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-const Agent = struct {
-    x: f32,
-    y: f32,
-    angle: f32, // radians
+// Clamp helpers so params stay sane
+inline fn clamp_f(v: f32, lo: f32, hi: f32) f32 {
+    return @max(lo, @min(hi, v));
+}
+
+// ── Colour schemes ────────────────────────────────────────────────────────────
+const Scheme = enum(u8) {
+    amber   = 0,
+    plasma  = 1,
+    acid    = 2,
+    ocean   = 3,
+    lava    = 4,
+    grey    = 5,
+    pub const count = 6;
+    pub fn name(s: Scheme) []const u8 {
+        return switch (s) {
+            .amber  => "Amber",
+            .plasma => "Plasma",
+            .acid   => "Acid Green",
+            .ocean  => "Deep Ocean",
+            .lava   => "Lava",
+            .grey   => "Greyscale",
+        };
+    }
 };
 
-// ── Global state (static to avoid large stack frames) ─────────────────────────
-var agents: [NUM_AGENTS]Agent = undefined;
-var trail:  [SIM_H][SIM_W]f32 = undefined;
-var diffuse_buf: [SIM_H][SIM_W]f32 = undefined;
+var current_scheme: Scheme = .amber;
 
-// ── PRNG ─────────────────────────────────────────────────────────────────────
-var rng = std.Random.DefaultPrng.init(0xdeadbeef_cafebabe);
-
-inline fn frand() f32 {
-    return rng.random().float(f32);
+// Pack ABGR (memory order R,G,B,A for SDL_PIXELFORMAT_ABGR8888)
+inline fn rgb(r: f32, g: f32, b: f32) u32 {
+    const ri: u32 = @intFromFloat(@min(255.0, r));
+    const gi: u32 = @intFromFloat(@min(255.0, g));
+    const bi: u32 = @intFromFloat(@min(255.0, b));
+    return ri | (gi << 8) | (bi << 16) | (0xFF << 24);
 }
 
-// ── Palette ───────────────────────────────────────────────────────────────────
-// Maps t in [0,1] to a warm-amber/white bioluminescent look (RGBA bytes).
+// Interpolate between two rgb stops, local t in [0,1]
+inline fn between(t: f32, r0: f32, g0: f32, b0: f32, r1: f32, g1: f32, b1: f32) u32 {
+    return rgb(r0 + (r1 - r0) * t, g0 + (g1 - g0) * t, b0 + (b1 - b0) * t);
+}
+
+// Each palette is a hand-unrolled multi-stop gradient.
+// Stops: (pos, r, g, b) — pos must be ascending, first=0.0, last=1.0.
+fn pal_amber(t: f32) u32 {
+    if (t < 0.3)  return between(t / 0.3,        0,  0,   8,  60,  15,   0);
+    if (t < 0.65) return between((t-0.3)/0.35,   60, 15,  0, 220, 100,  10);
+                  return between((t-0.65)/0.35, 220,100, 10, 255, 240, 200);
+}
+fn pal_plasma(t: f32) u32 {
+    if (t < 0.25) return between(t / 0.25,          0,  0,  20, 100,  0, 160);
+    if (t < 0.55) return between((t-0.25)/0.30,   100,  0,160, 220,  0, 200);
+    if (t < 0.80) return between((t-0.55)/0.25,   220,  0,200,   0,200, 220);
+                  return between((t-0.80)/0.20,     0,200,220, 230,255, 255);
+}
+fn pal_acid(t: f32) u32 {
+    if (t < 0.35) return between(t / 0.35,         0,  0,  0,   0, 60,   0);
+    if (t < 0.70) return between((t-0.35)/0.35,    0, 60,  0,  30,220,  10);
+                  return between((t-0.70)/0.30,    30,220, 10, 180,255, 120);
+}
+fn pal_ocean(t: f32) u32 {
+    if (t < 0.30) return between(t / 0.30,         0,  0, 20,   0, 30,  80);
+    if (t < 0.65) return between((t-0.30)/0.35,    0, 30, 80,   0,140, 160);
+                  return between((t-0.65)/0.35,    0,140,160, 180,240, 255);
+}
+fn pal_lava(t: f32) u32 {
+    if (t < 0.30) return between(t / 0.30,         0,  0,  0, 120,  0,   0);
+    if (t < 0.60) return between((t-0.30)/0.30,  120,  0,  0, 220, 60,   0);
+    if (t < 0.85) return between((t-0.60)/0.25,  220, 60,  0, 255,200,  20);
+                  return between((t-0.85)/0.15,  255,200, 20, 255,255, 200);
+}
+
 fn palette(t: f32) u32 {
-    // Low: deep blue-black → mid: orange-amber → high: white
-    const r: u8 = @intFromFloat(@min(255.0, t * t * 800.0));
-    const g: u8 = @intFromFloat(@min(255.0, t * t * 340.0));
-    const b: u8 = @intFromFloat(@min(255.0, t * 180.0 + t * t * 60.0));
-    const a: u8 = 255;
-    // Pack as ABGR8888 (what SDL_PIXELFORMAT_ABGR8888 expects in memory: R,G,B,A bytes)
-    return @as(u32, r) | (@as(u32, g) << 8) | (@as(u32, b) << 16) | (@as(u32, a) << 24);
+    return switch (current_scheme) {
+        .amber  => pal_amber(t),
+        .plasma => pal_plasma(t),
+        .acid   => pal_acid(t),
+        .ocean  => pal_ocean(t),
+        .lava   => pal_lava(t),
+        .grey   => blk: { const v = t * 255.0; break :blk rgb(v, v, v); },
+    };
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
-inline fn sample_trail(x: f32, y: f32) f32 {
-    const ix = @as(i32, @intFromFloat(x));
-    const iy = @as(i32, @intFromFloat(y));
-    if (ix < 0 or iy < 0 or ix >= SIM_W or iy >= SIM_H) return 0.0;
-    return trail[@intCast(iy)][@intCast(ix)];
-}
+// ── Agent ─────────────────────────────────────────────────────────────────────
+const Agent = struct { x: f32, y: f32, angle: f32 };
 
-// ── Init ──────────────────────────────────────────────────────────────────────
+// ── Global state ──────────────────────────────────────────────────────────────
+var agents:      [NUM_AGENTS]Agent       = undefined;
+var trail:       [SIM_H][SIM_W]f32      = undefined;
+var diffuse_buf: [SIM_H][SIM_W]f32      = undefined;
+var pixels:      [SIM_H * SIM_W]u32     = undefined;
+
+var rng = std.Random.DefaultPrng.init(0);
+inline fn frand() f32 { return rng.random().float(f32); }
+
+// ── Init / reset ──────────────────────────────────────────────────────────────
 fn init_agents() void {
     const cx: f32 = @as(f32, @floatFromInt(SIM_W)) * 0.5;
     const cy: f32 = @as(f32, @floatFromInt(SIM_H)) * 0.5;
     const spawn_r: f32 = @min(cx, cy) * 0.25;
-
     for (&agents) |*a| {
-        // Spawn in a circle, facing outward
         const angle = frand() * math.tau;
-        const r = frand() * spawn_r;
+        const r     = frand() * spawn_r;
         a.x     = cx + @cos(angle) * r;
         a.y     = cy + @sin(angle) * r;
-        a.angle = angle; // face outward
+        a.angle = angle;
     }
 }
 
-fn init_trail() void {
+fn clear_trail() void {
     for (&trail) |*row| @memset(row, 0.0);
 }
 
-// ── Simulation step ───────────────────────────────────────────────────────────
+// ── Simulation ────────────────────────────────────────────────────────────────
+inline fn sample(x: f32, y: f32) f32 {
+    const ix: i32 = @intFromFloat(x);
+    const iy: i32 = @intFromFloat(y);
+    if (ix < 0 or iy < 0 or ix >= SIM_W or iy >= SIM_H) return 0.0;
+    return trail[@intCast(iy)][@intCast(ix)];
+}
+
 fn step_agents() void {
     const fw: f32 = @floatFromInt(SIM_W);
     const fh: f32 = @floatFromInt(SIM_H);
 
     for (&agents) |*a| {
-        // Sensor positions
-        const sl = a.angle - SENSOR_ANGLE;
-        const sr = a.angle + SENSOR_ANGLE;
+        const sl = a.angle - p_sensor_angle;
+        const sr = a.angle + p_sensor_angle;
+        const sc = sample(a.x + @cos(a.angle) * p_sensor_dist,
+                          a.y + @sin(a.angle) * p_sensor_dist);
+        const sl_ = sample(a.x + @cos(sl) * p_sensor_dist,
+                           a.y + @sin(sl) * p_sensor_dist);
+        const sr_ = sample(a.x + @cos(sr) * p_sensor_dist,
+                           a.y + @sin(sr) * p_sensor_dist);
 
-        const sense_c = sample_trail(
-            a.x + @cos(a.angle) * SENSOR_DIST,
-            a.y + @sin(a.angle) * SENSOR_DIST,
-        );
-        const sense_l = sample_trail(
-            a.x + @cos(sl) * SENSOR_DIST,
-            a.y + @sin(sl) * SENSOR_DIST,
-        );
-        const sense_r = sample_trail(
-            a.x + @cos(sr) * SENSOR_DIST,
-            a.y + @sin(sr) * SENSOR_DIST,
-        );
-
-        // Steer
-        if (sense_c >= sense_l and sense_c >= sense_r) {
-            // Continue straight — tiny random wobble
-            a.angle += (frand() - 0.5) * TURN_SPEED * 0.2;
-        } else if (sense_l > sense_r) {
-            a.angle -= frand() * TURN_SPEED;
-        } else if (sense_r > sense_l) {
-            a.angle += frand() * TURN_SPEED;
+        if (sc >= sl_ and sc >= sr_) {
+            a.angle += (frand() - 0.5) * p_turn_speed * 0.2;
+        } else if (sl_ > sr_) {
+            a.angle -= frand() * p_turn_speed;
+        } else if (sr_ > sl_) {
+            a.angle += frand() * p_turn_speed;
         } else {
-            // Equal: random turn
-            a.angle += (frand() - 0.5) * TURN_SPEED;
+            a.angle += (frand() - 0.5) * p_turn_speed;
         }
 
-        // Move
-        const nx = a.x + @cos(a.angle) * AGENT_SPEED;
-        const ny = a.y + @sin(a.angle) * AGENT_SPEED;
+        a.x = @mod(a.x + @cos(a.angle) * p_speed + fw, fw);
+        a.y = @mod(a.y + @sin(a.angle) * p_speed + fh, fh);
 
-        // Wrap at boundaries
-        a.x = @mod(nx + fw, fw);
-        a.y = @mod(ny + fh, fh);
-
-        // Deposit
         const px: usize = @intFromFloat(a.x);
         const py: usize = @intFromFloat(a.y);
-        const cur = trail[py][px];
-        trail[py][px] = @min(1.0, cur + DEPOSIT * (1.0 / 255.0));
+        trail[py][px] = @min(1.0, trail[py][px] + p_deposit * (1.0 / 255.0));
     }
 }
 
 fn diffuse_and_decay() void {
-    // 3x3 box blur blended with original, then decay
-    const W: usize = SIM_W;
-    const H: usize = SIM_H;
-
+    const W = SIM_W;
+    const H = SIM_H;
     for (0..H) |y| {
         const ym = if (y == 0) H - 1 else y - 1;
         const yp = if (y == H - 1) 0 else y + 1;
         for (0..W) |x| {
             const xm = if (x == 0) W - 1 else x - 1;
             const xp = if (x == W - 1) 0 else x + 1;
-
-            const sum =
-                trail[ym][xm] + trail[ym][x] + trail[ym][xp] +
-                trail[y ][xm] + trail[y ][x]  + trail[y ][xp] +
-                trail[yp][xm] + trail[yp][x] + trail[yp][xp];
-
-            const blurred = sum * (1.0 / 9.0);
-            diffuse_buf[y][x] = std.math.lerp(trail[y][x], blurred, DIFFUSE_WEIGHT) * (1.0 - DECAY);
+            const blurred = (trail[ym][xm] + trail[ym][x] + trail[ym][xp] +
+                             trail[y ][xm] + trail[y ][x]  + trail[y ][xp] +
+                             trail[yp][xm] + trail[yp][x] + trail[yp][xp]) * (1.0 / 9.0);
+            diffuse_buf[y][x] = math.lerp(trail[y][x], blurred, p_diffuse_weight) * (1.0 - p_decay);
         }
     }
-
-    // Swap buffers
-    for (0..H) |y| {
-        @memcpy(&trail[y], &diffuse_buf[y]);
-    }
+    for (0..H) |y| @memcpy(&trail[y], &diffuse_buf[y]);
 }
-
-// ── Pixel buffer ─────────────────────────────────────────────────────────────
-var pixels: [SIM_H * SIM_W]u32 = undefined;
 
 fn render_pixels() void {
     for (0..SIM_H) |y| {
@@ -184,28 +216,36 @@ fn render_pixels() void {
 
 // ── SDL helpers ───────────────────────────────────────────────────────────────
 fn sdl_die(msg: []const u8) noreturn {
-    const err = c.SDL_GetError();
-    std.debug.print("SDL Error: {s}: {s}\n", .{ msg, err });
+    std.debug.print("SDL Error: {s}: {s}\n", .{ msg, c.SDL_GetError() });
     std.process.exit(1);
 }
 
-// ── Entry point ───────────────────────────────────────────────────────────────
-pub fn main() !void {
-    // Seed RNG with time
-    rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+fn update_title(window: *c.SDL_Window) void {
+    var buf: [256]u8 = undefined;
+    const s = std.fmt.bufPrintZ(&buf,
+        "Slime Mold [{s}]  spd={d:.2} sens={d:.1} turn={d:.2} decay={d:.3} diff={d:.2}  " ++
+        "1-6:scheme  [/]:decay  ,/.:sensor  ;/':turn  -/=:speed  d/f:diffuse  r:reset  c:clear  p:pause",
+        .{
+            current_scheme.name(),
+            p_speed, p_sensor_dist, p_turn_speed, p_decay, p_diffuse_weight,
+        },
+    ) catch return;
+    c.SDL_SetWindowTitle(window, s.ptr);
+}
 
-    init_trail();
+// ── Main ──────────────────────────────────────────────────────────────────────
+pub fn main() !void {
+    rng = std.Random.DefaultPrng.init(@intCast(std.time.milliTimestamp()));
+    clear_trail();
     init_agents();
 
     if (c.SDL_Init(c.SDL_INIT_VIDEO) != 0) sdl_die("SDL_Init");
     defer c.SDL_Quit();
 
     const window = c.SDL_CreateWindow(
-        "Slime Mold — Physarum polycephalum",
-        c.SDL_WINDOWPOS_CENTERED,
-        c.SDL_WINDOWPOS_CENTERED,
-        WIN_W,
-        WIN_H,
+        "Slime Mold",
+        c.SDL_WINDOWPOS_CENTERED, c.SDL_WINDOWPOS_CENTERED,
+        WIN_W, WIN_H,
         c.SDL_WINDOW_SHOWN,
     ) orelse sdl_die("SDL_CreateWindow");
     defer c.SDL_DestroyWindow(window);
@@ -220,33 +260,81 @@ pub fn main() !void {
         renderer,
         c.SDL_PIXELFORMAT_ABGR8888,
         c.SDL_TEXTUREACCESS_STREAMING,
-        WIN_W,
-        WIN_H,
+        WIN_W, WIN_H,
     ) orelse sdl_die("SDL_CreateTexture");
     defer c.SDL_DestroyTexture(texture);
 
+    update_title(window);
+
     var running = true;
+    var paused  = false;
+    var dirty_title = false; // set when params change, title updated next frame
+
     while (running) {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event) != 0) {
             switch (event.type) {
                 c.SDL_QUIT => running = false,
                 c.SDL_KEYDOWN => {
-                    if (event.key.keysym.sym == c.SDLK_ESCAPE) running = false;
+                    const sym = event.key.keysym.sym;
+                    switch (sym) {
+                        c.SDLK_ESCAPE => running = false,
+                        c.SDLK_p => paused = !paused,
+
+                        // ── Colour schemes ─────────────────────────────────
+                        c.SDLK_1 => { current_scheme = .amber;  dirty_title = true; },
+                        c.SDLK_2 => { current_scheme = .plasma; dirty_title = true; },
+                        c.SDLK_3 => { current_scheme = .acid;   dirty_title = true; },
+                        c.SDLK_4 => { current_scheme = .ocean;  dirty_title = true; },
+                        c.SDLK_5 => { current_scheme = .lava;   dirty_title = true; },
+                        c.SDLK_6 => { current_scheme = .grey;   dirty_title = true; },
+
+                        // ── Decay  [ / ] ───────────────────────────────────
+                        c.SDLK_LEFTBRACKET  => { p_decay = clamp_f(p_decay - 0.002, 0.001, 0.15); dirty_title = true; },
+                        c.SDLK_RIGHTBRACKET => { p_decay = clamp_f(p_decay + 0.002, 0.001, 0.15); dirty_title = true; },
+
+                        // ── Sensor distance  , / . ─────────────────────────
+                        c.SDLK_COMMA  => { p_sensor_dist = clamp_f(p_sensor_dist - 1.0, 1.0, 40.0); dirty_title = true; },
+                        c.SDLK_PERIOD => { p_sensor_dist = clamp_f(p_sensor_dist + 1.0, 1.0, 40.0); dirty_title = true; },
+
+                        // ── Turn speed  ; / ' ──────────────────────────────
+                        c.SDLK_SEMICOLON    => { p_turn_speed = clamp_f(p_turn_speed - 0.05, 0.01, 2.0); dirty_title = true; },
+                        c.SDLK_QUOTE        => { p_turn_speed = clamp_f(p_turn_speed + 0.05, 0.01, 2.0); dirty_title = true; },
+
+                        // ── Agent speed  - / = ─────────────────────────────
+                        c.SDLK_MINUS => { p_speed = clamp_f(p_speed - 0.25, 0.25, 8.0); dirty_title = true; },
+                        c.SDLK_EQUALS => { p_speed = clamp_f(p_speed + 0.25, 0.25, 8.0); dirty_title = true; },
+
+                        // ── Diffuse weight  d / f ──────────────────────────
+                        c.SDLK_d => { p_diffuse_weight = clamp_f(p_diffuse_weight - 0.05, 0.0, 1.0); dirty_title = true; },
+                        c.SDLK_f => { p_diffuse_weight = clamp_f(p_diffuse_weight + 0.05, 0.0, 1.0); dirty_title = true; },
+
+                        // ── Reset / clear ──────────────────────────────────
+                        c.SDLK_r => { clear_trail(); init_agents(); dirty_title = true; },
+                        c.SDLK_c => { clear_trail(); },
+
+                        else => {},
+                    }
                 },
                 else => {},
             }
         }
 
-        // Simulate
-        step_agents();
-        diffuse_and_decay();
+        if (!paused) {
+            step_agents();
+            diffuse_and_decay();
+        }
+
         render_pixels();
 
-        // Upload & present
         _ = c.SDL_UpdateTexture(texture, null, &pixels, WIN_W * 4);
         _ = c.SDL_RenderClear(renderer);
         _ = c.SDL_RenderCopy(renderer, texture, null, null);
         c.SDL_RenderPresent(renderer);
+
+        if (dirty_title) {
+            update_title(window);
+            dirty_title = false;
+        }
     }
 }
