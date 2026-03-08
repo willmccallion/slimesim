@@ -2,6 +2,8 @@
 
 Physarum polycephalum slime mold simulation — 200k agents, real-time, interactive.
 
+![slime mold simulation](assets/slime.png)
+
 Built with Zig + SDL2.
 
 ## Build
