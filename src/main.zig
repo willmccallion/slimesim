@@ -7,7 +7,7 @@
 //   ; / '      turn speed down / up
 //   - / =      agent speed down / up
 //   D / F      diffuse weight down / up
-//   R          reset everything
+//   R          reset params, trail, and agents
 //   C          clear trail (agents keep going)
 //   P          pause / resume
 //   Escape     quit
@@ -224,7 +224,7 @@ fn update_title(window: *c.SDL_Window) void {
     var buf: [256]u8 = undefined;
     const s = std.fmt.bufPrintZ(&buf,
         "Slime Mold [{s}]  spd={d:.2} sens={d:.1} turn={d:.2} decay={d:.3} diff={d:.2}  " ++
-        "1-6:scheme  [/]:decay  ,/.:sensor  ;/':turn  -/=:speed  d/f:diffuse  r:reset  c:clear  p:pause",
+        "1-6:scheme  [/]:decay  ,/.:sensor  ;/':turn  -/=:speed  d/f:diffuse  r:full reset  c:clear trail  p:pause",
         .{
             current_scheme.name(),
             p_speed, p_sensor_dist, p_turn_speed, p_decay, p_diffuse_weight,
@@ -310,7 +310,19 @@ pub fn main() !void {
                         c.SDLK_f => { p_diffuse_weight = clamp_f(p_diffuse_weight + 0.05, 0.0, 1.0); dirty_title = true; },
 
                         // ── Reset / clear ──────────────────────────────────
-                        c.SDLK_r => { clear_trail(); init_agents(); dirty_title = true; },
+                        c.SDLK_r => {
+                            p_speed          = 1.5;
+                            p_sensor_dist    = 9.0;
+                            p_sensor_angle   = 0.436;
+                            p_turn_speed     = 0.3;
+                            p_deposit        = 5.0;
+                            p_decay          = 0.012;
+                            p_diffuse_weight = 0.2;
+                            current_scheme   = .amber;
+                            clear_trail();
+                            init_agents();
+                            dirty_title = true;
+                        },
                         c.SDLK_c => { clear_trail(); },
 
                         else => {},

@@ -1,4 +1,4 @@
-# pbuild.toml — NES Emulator
+# pbuild.toml — Slime Mold Simulation
 #
 # Run `pbuild --list` to see all targets.
 # Run `pbuild <target>` to build a specific target.
@@ -14,7 +14,7 @@ zig = "zig"
 
 [build]
 group       = "Build"
-description = "Build the NES emulator (debug)"
+description = "Build the slime mold simulation (debug)"
 type        = "task"
 command     = ["zig", "build"]
 
@@ -26,9 +26,9 @@ command     = ["zig", "build", "-Doptimize=ReleaseFast"]
 
 [run]
 group       = "Run"
-description = "Build and run with ReleaseFast (pass ROM via -- path/to/rom.nes)"
+description = "Build and run with ReleaseFast"
 type        = "task"
-command     = ["zig", "build", "run", "-Doptimize=ReleaseFast", "--", "{{args}}"]
+command     = ["zig", "build", "run", "-Doptimize=ReleaseFast"]
 
 [test]
 group       = "Build"
