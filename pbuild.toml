@@ -1,0 +1,54 @@
+# pbuild.toml — NES Emulator
+#
+# Run `pbuild --list` to see all targets.
+# Run `pbuild <target>` to build a specific target.
+# Run `pbuild` to build the default target.
+
+[config]
+default = "build"
+
+[vars]
+zig = "zig"
+
+# ── Rules ─────────────────────────────────────────────────────────────────────
+
+[build]
+group       = "Build"
+description = "Build the NES emulator (debug)"
+type        = "task"
+command     = ["zig", "build"]
+
+[release]
+group       = "Build"
+description = "Build optimized release binary"
+type        = "task"
+command     = ["zig", "build", "-Doptimize=ReleaseFast"]
+
+[run]
+group       = "Run"
+description = "Build and run with ReleaseFast (pass ROM via -- path/to/rom.nes)"
+type        = "task"
+command     = ["zig", "build", "run", "-Doptimize=ReleaseFast", "--", "{{args}}"]
+
+[test]
+group       = "Build"
+description = "Run unit tests"
+type        = "task"
+command     = ["zig", "build", "test"]
+
+[clean]
+description = "Remove build artifacts"
+type        = "task"
+commands    = [["rm", "-rf", "zig-out"], ["rm", "-rf", ".zig-cache"]]
+
+[check]
+group       = "Dev"
+description = "Type-check without producing a binary (fast iteration)"
+type        = "task"
+command     = ["zig", "build", "--summary", "none"]
+
+[fmt]
+group       = "Dev"
+description = "Format all Zig source files"
+type        = "task"
+command     = ["zig", "fmt", "src/", "build.zig"]
